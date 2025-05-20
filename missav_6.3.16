@@ -1,0 +1,717 @@
+import tkinter as tk
+from tkinter import ttk
+from tkinter import filedialog, scrolledtext, messagebox
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service as ChromeService
+from selenium.webdriver.chrome.options import Options
+from webdriver_manager.chrome import ChromeDriverManager
+import os
+import threading
+import logging
+import re
+import subprocess
+from urllib.parse import urlparse
+import time
+import collections
+import shutil
+import locale
+
+# --- 로깅 설정 ---
+LOG_FILENAME = 'debug_downloader_m3u8_v6.3.16.txt'
+logging.basicConfig(
+    filename=LOG_FILENAME,
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(threadName)s - %(funcName)s - %(message)s',
+    filemode='w'
+)
+
+# --- 전역 상수 ---
+USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+TEMP_DOWNLOAD_SUBDIR = "_temp_downloads"
+MAX_CONCURRENT_DOWNLOADS_DEFAULT = 2
+CLIPBOARD_CHECK_INTERVAL_MS = 2000
+SELENIUM_JS_WAIT_TIME_S = 8
+
+class VideoDownloaderApp:
+    def __init__(self, root_window):
+        self.root = root_window
+        self.root.title(f"M3U8 다운로더 (URL파일명) v6.3.16")
+        self.root.geometry("800x900")
+
+        self.is_processing_auto = False
+        self.is_manual_analyzing = False
+        self.last_clipboard_content = ""
+        self.clipboard_monitoring_active = False
+        self.after_id_clipboard_check = None
+
+        self.download_queue = collections.deque()
+        self.pending_urls_queue = collections.deque()
+        
+        self.active_downloads = 0
+        self.download_lock = threading.Lock()
+        self.MAX_CONCURRENT_DOWNLOADS = MAX_CONCURRENT_DOWNLOADS_DEFAULT
+
+        self._setup_ui()
+
+        logging.info("애플리케이션 시작됨 (v6.3.16)")
+        self.log_message(f"디버그 로그: '{LOG_FILENAME}'")
+        self.log_message("yt-dlp, FFmpeg PATH 설정 필요.")
+        self.log_message("v6.3.16: AttributeError (listbox update func) 수정.")
+        self.update_global_ui_state()
+
+    def _setup_ui(self):
+        # (V6.3.15와 UI 구조 동일)
+        frame_top_controls = ttk.Frame(self.root, padding="10")
+        frame_top_controls.grid(row=0, column=0, sticky="ew", columnspan=3)
+        
+        ttk.Label(frame_top_controls, text="페이지 URL:").grid(row=0, column=0, padx=5, pady=5, sticky="w")
+        self.url_entry = ttk.Entry(frame_top_controls, width=70)
+        self.url_entry.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
+        self.url_entry.insert(0, "https://missav.ws/ko/...")
+
+        ttk.Label(frame_top_controls, text="저장 폴더:").grid(row=1, column=0, padx=5, pady=5, sticky="w")
+        self.folder_path_var = tk.StringVar()
+        self.folder_entry = ttk.Entry(frame_top_controls, textvariable=self.folder_path_var, width=55, state='readonly')
+        self.folder_entry.grid(row=1, column=1, padx=5, pady=5, sticky="ew")
+        self.browse_button = ttk.Button(frame_top_controls, text="폴더 선택", command=self.browse_folder)
+        self.browse_button.grid(row=1, column=2, padx=5, pady=5, sticky="e")
+
+        ttk.Label(frame_top_controls, text="저장 파일명 (MP4):").grid(row=2, column=0, padx=5, pady=5, sticky="w")
+        self.filename_entry = ttk.Entry(frame_top_controls, width=70)
+        self.filename_entry.grid(row=2, column=1, padx=5, pady=5, sticky="ew")
+
+        self.analyze_button = ttk.Button(frame_top_controls, text="M3U8 링크 분석 (수동)", command=self.start_analysis_thread)
+        self.analyze_button.grid(row=3, column=0, padx=5, pady=10, sticky="ew")
+        self.download_button = ttk.Button(frame_top_controls, text="선택된 M3U8 다운로드", command=self.start_manual_download)
+        self.download_button.grid(row=3, column=1, padx=5, pady=10, sticky="ew", columnspan=2)
+        
+        frame_top_controls.grid_columnconfigure(1, weight=1)
+
+        m3u8_list_frame = ttk.LabelFrame(self.root, text=" 찾은 M3U8 링크 (수동 분석 결과) ", padding="5")
+        m3u8_list_frame.grid(row=1, column=0, columnspan=3, padx=10, pady=5, sticky="ew")
+        self.link_listbox = tk.Listbox(m3u8_list_frame, selectmode=tk.SINGLE, width=80, height=3)
+        self.link_listbox.pack(side="left", fill="both", expand=True)
+        m3u8_scrollbar = ttk.Scrollbar(m3u8_list_frame, orient="vertical", command=self.link_listbox.yview)
+        m3u8_scrollbar.pack(side="right", fill="y")
+        self.link_listbox.config(yscrollcommand=m3u8_scrollbar.set)
+
+        auto_dl_frame = ttk.Frame(self.root, padding=(10,5,10,0))
+        auto_dl_frame.grid(row=2, column=0, columnspan=3, sticky="ew")
+        self.auto_download_var = tk.BooleanVar()
+        self.auto_download_checkbutton = ttk.Checkbutton(auto_dl_frame, text="자동 다운로드 활성화 (missav.ws URL 복사 시)",
+                                                        variable=self.auto_download_var, command=self.toggle_clipboard_monitoring)
+        self.auto_download_checkbutton.pack(side="left")
+
+        progress_section_label = ttk.Label(self.root, text="다운로드 진행:", padding=(10,5,0,0))
+        progress_section_label.grid(row=3, column=0, sticky="w", columnspan=3)
+        self.progress_area_frame = ttk.Frame(self.root, padding=(10,0,10,5))
+        self.progress_area_frame.grid(row=4, column=0, columnspan=3, sticky="ew")
+        
+        self.progress_elements = []
+        for i in range(self.MAX_CONCURRENT_DOWNLOADS):
+            slot_frame = ttk.Frame(self.progress_area_frame)
+            slot_frame.grid(row=i, column=0, sticky="ew", pady=2)
+            self.progress_area_frame.grid_columnconfigure(0, weight=1)
+            label = ttk.Label(slot_frame, text=f"슬롯 {i+1}: 대기 중", anchor="w", width=70)
+            label.pack(side="left", fill="x", expand=True, padx=(0,5))
+            p_bar = ttk.Progressbar(slot_frame, orient="horizontal", length=100, mode="determinate")
+            p_bar.pack(side="left", fill="x", expand=True)
+            self.progress_elements.append({'bar': p_bar, 'label': label, 'active_file_key': None, '_filename_for_display': ''})
+
+        queue_info_outer_frame = ttk.LabelFrame(self.root, text=" 작업 대기열 ", padding="5")
+        queue_info_outer_frame.grid(row=5, column=0, columnspan=3, padx=10, pady=5, sticky="ew")
+        queue_info_outer_frame.grid_columnconfigure(0, weight=1)
+        
+        queue_info_frame = ttk.Frame(queue_info_outer_frame)
+        queue_info_frame.pack(fill="x", expand=True)
+        queue_info_frame.grid_columnconfigure(0, weight=1)
+        queue_info_frame.grid_columnconfigure(1, weight=1)
+
+        pending_urls_label = ttk.Label(queue_info_frame, text="분석 대기 URL:")
+        pending_urls_label.grid(row=0, column=0, sticky="nw", padx=(0,5))
+        self.pending_urls_listbox = tk.Listbox(queue_info_frame, height=3, width=45)
+        self.pending_urls_listbox.grid(row=1, column=0, sticky="nsew", padx=(0,5))
+        pending_urls_scrollbar = ttk.Scrollbar(queue_info_frame, orient="vertical", command=self.pending_urls_listbox.yview)
+        pending_urls_scrollbar.grid(row=1, column=0, sticky="nse", padx=(0,5))
+        self.pending_urls_listbox.config(yscrollcommand=pending_urls_scrollbar.set)
+
+        download_q_label = ttk.Label(queue_info_frame, text="다운로드 대기 작업:")
+        download_q_label.grid(row=0, column=1, sticky="nw", padx=(5,0))
+        self.download_queue_listbox = tk.Listbox(queue_info_frame, height=3, width=45)
+        self.download_queue_listbox.grid(row=1, column=1, sticky="nsew", padx=(5,0))
+        download_q_scrollbar = ttk.Scrollbar(queue_info_frame, orient="vertical", command=self.download_queue_listbox.yview)
+        download_q_scrollbar.grid(row=1, column=1, sticky="nse", padx=(5,0))
+        self.download_queue_listbox.config(yscrollcommand=download_q_scrollbar.set)
+
+        log_section_label = ttk.Label(self.root, text="상태 및 로그:", padding=(10,10,0,0))
+        log_section_label.grid(row=6, column=0, sticky="w", columnspan=3)
+        self.status_text = scrolledtext.ScrolledText(self.root, width=80, height=8, state=tk.DISABLED, wrap=tk.WORD)
+        self.status_text.grid(row=7, column=0, columnspan=3, padx=10, pady=5, sticky="nsew")
+
+        self.root.grid_rowconfigure(7, weight=1)
+        self.root.grid_columnconfigure(0, weight=1)
+
+    # --- 이하 메서드들은 V6.3.15와 동일하거나, 지적된 AttributeError를 수정한 버전입니다. ---
+
+    def _update_pending_urls_listbox(self): # 메서드 정의 추가
+        if hasattr(self, 'pending_urls_listbox') and self.pending_urls_listbox.winfo_exists():
+            self.pending_urls_listbox.delete(0, tk.END)
+            with self.download_lock:
+                for url in self.pending_urls_queue:
+                    display_url = url if len(url) <= 50 else "..." + url[-47:]
+                    self.pending_urls_listbox.insert(tk.END, display_url)
+        else:
+            logging.warning("_update_pending_urls_listbox: pending_urls_listbox 위젯이 아직 없거나 파괴됨.")
+    
+    def _update_download_queue_listbox(self): # 메서드 정의 추가
+        if hasattr(self, 'download_queue_listbox') and self.download_queue_listbox.winfo_exists():
+            self.download_queue_listbox.delete(0, tk.END)
+            with self.download_lock:
+                for item in self.download_queue:
+                    display_name = item[3]
+                    if len(display_name) > 40:
+                        display_name = display_name[:20] + "..." + display_name[-15:]
+                    self.download_queue_listbox.insert(tk.END, display_name)
+        else:
+            logging.warning("_update_download_queue_listbox: download_queue_listbox 위젯이 아직 없거나 파괴됨.")
+
+
+    def log_message(self, message, level="INFO"):
+        if level == "PROGRESS": logging.debug(f"PROGRESS_EVENT: {message}"); return
+        if not hasattr(self, 'status_text') or not self.status_text.winfo_exists():
+            print(f"임시 출력(status_text 없음) [{level}]: {message}"); logging.error("log_message 호출 시 self.status_text 없음!"); return
+        self.status_text.config(state=tk.NORMAL)
+        prefix = f"[{level}] "; 
+        if level == "DEBUG_YT": prefix = ""
+        self.status_text.insert(tk.END, f"{prefix}{message}\n"); self.status_text.see(tk.END); self.status_text.config(state=tk.DISABLED)
+        if level == "ERROR": logging.error(message)
+        elif level == "WARNING": logging.warning(message)
+        else: logging.info(message)
+
+    def update_ui_specific_progress(self, slot_index, percent_float, filename, size_str):
+        if 0 <= slot_index < len(self.progress_elements):
+            slot = self.progress_elements[slot_index]; slot['bar']['value'] = percent_float
+            display_name_short = filename if len(filename) <= 45 else filename[:25] + "..." + filename[-15:]
+            slot['label'].config(text=f"{display_name_short} ({size_str})")
+            logging.debug(f"UI_PROGRESS Slot {slot_index}: {filename} - {percent_float:.1f}% ({size_str})")
+
+    def clear_progress_slot(self, slot_index, status_message, success=False):
+        if 0 <= slot_index < len(self.progress_elements):
+            slot = self.progress_elements[slot_index]; filename_done = slot['_filename_for_display'] 
+            label_text_filename = filename_done if len(filename_done) <=35 else (filename_done[:20] + "..." + filename_done[-10:]) if filename_done else f"슬롯 {slot_index+1}"
+            slot['label'].config(text=f"{label_text_filename}: {status_message}"); slot['bar']['value'] = 100 if success else 0
+            slot['active_file_key'] = None; slot['_filename_for_display'] = ''
+            logging.debug(f"UI_PROGRESS Slot {slot_index} cleared. Filename: {filename_done}, Status: {status_message}")
+
+    def browse_folder(self):
+        folder_selected = filedialog.askdirectory()
+        if folder_selected: self.folder_path_var.set(folder_selected); self.log_message(f"저장 폴더: {folder_selected}")
+
+    def update_global_ui_state(self):
+        with self.download_lock: is_globally_busy = (self.active_downloads > 0 or len(self.download_queue) > 0 or self.is_processing_auto or self.is_manual_analyzing)
+        state_to_set = tk.DISABLED if is_globally_busy else tk.NORMAL
+        widget_names = ["analyze_button", "browse_button", "url_entry", "filename_entry", "auto_download_checkbutton", "download_button"]
+        for name in widget_names:
+            if hasattr(self, name): 
+                widget = getattr(self, name)
+                if widget and widget.winfo_exists(): 
+                    widget.config(state=state_to_set)
+        
+        if hasattr(self, 'download_button') and self.download_button.winfo_exists():
+            if not is_globally_busy and hasattr(self, 'link_listbox') and \
+               self.link_listbox.winfo_exists() and self.link_listbox.size() > 0 and \
+               self.link_listbox.curselection():
+                self.download_button.config(state=tk.NORMAL)
+            else:
+                self.download_button.config(state=tk.DISABLED)
+
+    def sanitize_filename(self, filename_to_sanitize):
+        if not isinstance(filename_to_sanitize, str): 
+            logging.warning(f"sanitize_filename에 문자열 아닌 값: {type(filename_to_sanitize)}")
+            return f"invalid_input_{int(time.time())}"
+        filename = re.sub(r'[\\/*?:"<>|]', "", filename_to_sanitize)
+        filename = filename.strip()
+        filename = re.sub(r'\s+', '_', filename)
+        return filename[:200] if filename else "default_vidname_" + str(int(time.time()))
+
+    def extract_filename_from_url(self, page_url):
+        try:
+            if not page_url: return f"fname_extract_emptyurl_{int(time.time())}"
+            parsed_url = urlparse(page_url)
+            path_segments = [segment for segment in parsed_url.path.split('/') if segment]
+            if not path_segments: 
+                self.log_message(f"URL 경로없어 파일명추출불가: {page_url}","DEBUG")
+                return f"fname_extract_nopath_{int(time.time())}"
+            
+            for i in range(len(path_segments) -1, -1, -1):
+                segment = path_segments[i]
+                cleaned_segment = segment
+                common_suffixes = ["-uncensored-leak","-uncensored","-leak","-subtitle","-sub","-hd","-fhd","-1080p","-720p"]
+                for suffix in common_suffixes:
+                    if cleaned_segment.lower().endswith(suffix.lower()): 
+                        cleaned_segment = cleaned_segment[:-len(suffix)]
+                        break 
+                match = re.fullmatch(r'([a-zA-Z0-9]+(?:-[a-zA-Z0-9]+)*-\d+)', cleaned_segment, re.IGNORECASE)
+                if match: 
+                    self.log_message(f"URL파일명추출(ID패턴):'{match.group(1)}'from'{segment}'","DEBUG")
+                    return match.group(1)
+            
+            last_resort_name = path_segments[-1]
+            for suffix in common_suffixes:
+                 if last_resort_name.lower().endswith(suffix.lower()): 
+                    last_resort_name = last_resort_name[:-len(suffix)]
+            
+            excluded_terms = ['ko','en','jp','cn','us','www','video','movie','watch','play','view']
+            if last_resort_name and len(last_resort_name)>=3 and not(last_resort_name.lower() in excluded_terms):
+                 self.log_message(f"URL파일명추출(폴백/마지막경로):'{last_resort_name}'","DEBUG")
+                 return last_resort_name
+            
+            final_fallback_name = f"fname_extract_failed_{int(time.time())}"
+            self.log_message(f"URL 특정패턴 파일명추출 최종실패, 폴백사용:'{final_fallback_name}'(URL:{page_url})","WARNING")
+            return final_fallback_name
+        except Exception as e: 
+            self.log_message(f"URL 파일명추출중 예외:{e}","ERROR")
+            return f"fname_extract_exception_{int(time.time())}"
+
+    def toggle_clipboard_monitoring(self):
+        if self.auto_download_var.get():
+            if not self.folder_path_var.get(): 
+                messagebox.showwarning("경고", "저장 폴더를 선택하세요.")
+                self.auto_download_var.set(False)
+                return
+            self.clipboard_monitoring_active = True
+            self.last_clipboard_content = ""
+            try: self.last_clipboard_content = self.root.clipboard_get()
+            except tk.TclError: self.last_clipboard_content = ""
+            self.log_message("클립보드 자동 감지 시작.")
+            if self.after_id_clipboard_check: self.root.after_cancel(self.after_id_clipboard_check)
+            self.check_clipboard()
+        else:
+            self.clipboard_monitoring_active = False
+            if self.after_id_clipboard_check: 
+                self.root.after_cancel(self.after_id_clipboard_check)
+                self.after_id_clipboard_check = None
+            self.log_message("클립보드 자동 감지 중지.")
+        self.update_global_ui_state()
+
+    def check_clipboard(self): # 보류 큐(pending_urls_queue) 로직 적용
+        if not self.clipboard_monitoring_active: return
+        try: current_clipboard = self.root.clipboard_get()
+        except tk.TclError: current_clipboard = ""
+        
+        if current_clipboard and current_clipboard != self.last_clipboard_content:
+            self.log_message(f"클립보드 변경 감지: '{current_clipboard[:100]}...'", "DEBUG")
+            self.last_clipboard_content = current_clipboard
+            
+            is_target_url = "missav.ws" in current_clipboard.lower() and \
+                            (current_clipboard.startswith("http://") or current_clipboard.startswith("https://"))
+            self.log_message(f"MissAV URL 여부: {is_target_url} (URL: '{current_clipboard[:70]}...')", "DEBUG")
+
+            if is_target_url:
+                should_process_immediately = False
+                with self.download_lock:
+                    if not self.is_processing_auto and not self.pending_urls_queue:
+                        self.is_processing_auto = True
+                        should_process_immediately = True
+                    else: 
+                        if current_clipboard not in self.pending_urls_queue:
+                            self.pending_urls_queue.append(current_clipboard)
+                            self.log_message(f"URL '{current_clipboard[:70]}...' 보류 큐에 추가됨 (대기: {len(self.pending_urls_queue)}).", "INFO")
+                            self.root.after(0, self._update_pending_urls_listbox) # UI 업데이트
+                        else:
+                            self.log_message(f"URL '{current_clipboard[:70]}...' 이미 보류 큐에 존재함.", "DEBUG")
+                
+                if should_process_immediately:
+                    self.log_message(f"자동 처리 즉시 시작: {current_clipboard}", "INFO")
+                    self.root.after(0, self._start_auto_processing_for_url, current_clipboard)
+            else: 
+                self.log_message(f"MissAV URL 아님: '{current_clipboard[:70]}...'", "DEBUG")
+        
+        if self.clipboard_monitoring_active: 
+            self.after_id_clipboard_check = self.root.after(CLIPBOARD_CHECK_INTERVAL_MS, self.check_clipboard)
+
+    def _start_auto_processing_for_url(self, page_url):
+        self.root.after(0, self.update_global_ui_state)
+        threading.Thread(target=self.process_copied_url, args=(page_url,), name=f"AutoProcess-{page_url[-20:]}").start()
+
+    def _process_next_pending_url(self):
+        next_url_to_process = None
+        with self.download_lock:
+            if self.pending_urls_queue:
+                if not self.is_processing_auto:
+                    next_url_to_process = self.pending_urls_queue.popleft()
+                    self.is_processing_auto = True
+                    self.log_message(f"보류 큐에서 다음 URL 처리 시작: {next_url_to_process}", "INFO")
+                    self.root.after(0, self._update_pending_urls_listbox)
+                else:
+                    self.log_message(f"보류 큐 확인: 다음 URL({self.pending_urls_queue[0][:70]}...) 있으나, is_processing_auto({self.is_processing_auto})가 True.", "DEBUG") # noqa
+            else:
+                self.log_message(f"보류 큐 비어있음. 추가 자동 작업 없음.", "DEBUG")
+
+        if next_url_to_process:
+            self.root.after(0, self._start_auto_processing_for_url, next_url_to_process)
+        elif not self.is_processing_auto and not self.download_queue and self.active_downloads == 0 and not self.pending_urls_queue:
+            self.log_message(f"모든 자동 처리 및 다운로드 작업 완료됨.", "INFO")
+            self.root.after(0, self.update_global_ui_state)
+    
+    def process_copied_url(self, page_url):
+        self.root.after(0, self.log_message, f"process_copied_url 시작 (URL: {page_url})", "DEBUG")
+        extracted_filename_base = self.extract_filename_from_url(page_url)
+        final_filename_base = self.sanitize_filename(extracted_filename_base) 
+        self.log_message(f"URL 기반 최종 파일명: '{final_filename_base}' (추출 시도: '{extracted_filename_base}')", "INFO")
+        
+        def update_gui_and_start_auto_analysis_cb():
+            self.url_entry.delete(0,tk.END); self.url_entry.insert(0,page_url)
+            self.filename_entry.delete(0,tk.END); self.filename_entry.insert(0,final_filename_base)
+            self.link_listbox.delete(0,tk.END) 
+            
+            if not self.folder_path_var.get():
+                messagebox.showerror("오류","저장 폴더가 선택되지 않았습니다.")
+                with self.download_lock: self.is_processing_auto = False
+                self.root.after(0, self.update_global_ui_state)
+                self.root.after(0, self._process_next_pending_url); return
+            
+            self.log_message(f"M3U8 분석 시작 (파일명: '{final_filename_base}')...")
+            analysis_thread = threading.Thread(
+                target=self.analyze_m3u8_links_for_auto,
+                args=(page_url,final_filename_base),
+                name="AutoAnalyzeM3U8Thread"
+            )
+            analysis_thread.daemon = True
+            analysis_thread.start()
+        
+        self.root.after(0,update_gui_and_start_auto_analysis_cb)
+
+    def start_analysis_thread(self):
+        can_start_manual_analysis = False
+        with self.download_lock:
+            if not (self.active_downloads > 0 or len(self.download_queue) > 0 or 
+                    self.is_processing_auto or self.is_manual_analyzing):
+                self.is_manual_analyzing = True; can_start_manual_analysis = True
+        
+        if can_start_manual_analysis:
+            self.root.after(0, self.update_global_ui_state)
+            current_page_url = self.url_entry.get()
+            
+            if not current_page_url:
+                messagebox.showerror("오류", "페이지 URL을 입력하세요.")
+                with self.download_lock: self.is_manual_analyzing = False
+                self.root.after(0, self.update_global_ui_state); return
+            
+            extracted_filename = self.extract_filename_from_url(current_page_url)
+            sanitized_filename = self.sanitize_filename(extracted_filename)
+            self.filename_entry.delete(0, tk.END); self.filename_entry.insert(0, sanitized_filename)
+            self.log_message(f"수동 분석: URL 기반 제안 파일명 - '{sanitized_filename}'", "INFO")
+            
+            self.link_listbox.delete(0, tk.END)
+            self.log_message(f"M3U8 링크 분석 시작 (수동 - {current_page_url})...")
+            analysis_thread = threading.Thread(
+                target=self.analyze_m3u8_links, 
+                args=(current_page_url, sanitized_filename), 
+                name="ManualAnalyzeM3U8Thread"
+            )
+            analysis_thread.daemon = True
+            analysis_thread.start()
+        else: 
+            messagebox.showwarning("대기", "다른 작업(자동 처리/분석 또는 다운로드)이 진행 중입니다.")
+
+    # --- 나머지 메서드들은 V6.3.15와 동일하게 유지 ---
+    # analyze_m3u8_links_for_auto, analyze_m3u8_links, deobfuscate_missav_source,
+    # _auto_download_add_to_queue, start_manual_download, try_start_next_download,
+    # download_with_yt_dlp 메서드들은 이전 답변의 V6.3.15 코드를 참조하여
+    # 여기에 그대로 복사하여 붙여넣습니다. (코드 길이 관계상 전체 반복 생략)
+
+    # ... (V6.3.15 버전의 analyze_m3u8_links_for_auto 부터 download_with_yt_dlp 까지의 메서드 코드를 여기에 삽입) ...
+    # (아래는 V6.3.15 버전의 해당 메서드들입니다. 이 부분을 위 주석 자리에 넣어주세요)
+
+    def analyze_m3u8_links_for_auto(self, page_url, filename_base_for_use):
+        m3u8_found_links = []; page_source = ""; driver = None; analysis_success = False
+        try:
+            logging.info(f"자동M3U8분석:{page_url}(파일명:{filename_base_for_use})")
+            self.root.after(0,self.log_message,f"페이지 로드(자동):{page_url}")
+            opts=Options(); opts.add_argument("--headless"); opts.add_argument("--disable-gpu"); opts.add_argument("--no-sandbox"); opts.add_argument("--disable-dev-shm-usage"); opts.add_argument(f"user-agent={USER_AGENT}"); opts.add_experimental_option('excludeSwitches',['enable-automation']); opts.add_experimental_option('useAutomationExtension',False) # noqa
+            try: 
+                driver=webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()),options=opts)
+                driver.execute_cdp_cmd('Network.setUserAgentOverride',{"userAgent":USER_AGENT})
+            except Exception as e: 
+                logging.error(f"ChromeDriver로드실패(자동):{e}")
+                self.root.after(0,self.log_message,f"ChromeDriver로드실패(자동):{e}.","ERROR")
+                return 
+            driver.get(page_url); time.sleep(SELENIUM_JS_WAIT_TIME_S); page_source=driver.page_source
+            try:
+                js_src=driver.execute_script("return (typeof source !== 'undefined' && source.includes('.m3u8'))?source:null")
+                if js_src and js_src not in m3u8_found_links: m3u8_found_links.append(js_src); self.root.after(0,self.log_message,f"JS 'source'(자동):{js_src[:70]}..","DEBUG") # noqa
+                plyr_src=driver.execute_script("return (typeof window.player !== 'undefined' && typeof window.player.source === 'string' && window.player.source.includes('.m3u8'))?window.player.source:(typeof window.hls !== 'undefined' && typeof window.hls.url === 'string' && window.hls.url.includes('.m3u8'))?window.hls.url:null") # noqa
+                if plyr_src and plyr_src not in m3u8_found_links: m3u8_found_links.append(plyr_src); self.root.after(0,self.log_message,f"JS Plyr/HLS(자동):{plyr_src[:70]}..","DEBUG") # noqa
+            except Exception as e_js: self.root.after(0,self.log_message,f"JS 직접실행오류(자동):{e_js}","WARNING")
+            if driver:driver.quit();driver=None
+            eval_s=re.search(r"eval\s*\(\s*function\s*\(p,[^)]+\)\s*\{([\s\S]+?)\}\s*\(([^)]+)\)\s*\)",page_source,re.DOTALL)
+            if eval_s:
+                eval_full_call = eval_s.group(0); eval_args_str = eval_s.group(2); pcode = ""; kstr = ""
+                first_arg_match = re.match(r"\s*'((?:\\'|[^'])*)'", eval_args_str); pcode = first_arg_match.group(1) if first_arg_match else ""
+                kstr_match = re.search(r",\s*'((?:\\'|[^'])*)'\.split\('\|'\)", eval_full_call); kstr = kstr_match.group(1) if kstr_match else ""
+                if pcode and kstr: 
+                    deob_url=self.deobfuscate_missav_source(pcode,kstr)
+                    if deob_url and deob_url not in m3u8_found_links: 
+                        m3u8_found_links.append(deob_url)
+                        self.root.after(0,self.log_message,f"난독화해제M3U8(자동):{deob_url}","INFO")
+                else:logging.warning(f"자동분석:eval인자파싱실패.Args:'{eval_args_str[:100]}...' FullEval:'{eval_full_call[:100]}...'")
+            if not m3u8_found_links:
+                for link in re.findall(r'(https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*?)',page_source,re.IGNORECASE):
+                    pu=urlparse(link)
+                    if pu.scheme and pu.netloc and link not in m3u8_found_links: m3u8_found_links.append(link)
+                    logging.info(f"일반RegexM3U8(자동):{link}")
+            if m3u8_found_links:
+                unique_links=[li for i,li in enumerate(m3u8_found_links) if li not in m3u8_found_links[:i]]
+                self.root.after(0,self._auto_download_add_to_queue,unique_links, filename_base_for_use)
+                analysis_success=True
+            else: self.root.after(0,self.log_message,f"M3U8링크최종실패(자동-{filename_base_for_use}).","WARNING")
+        except Exception as e: self.root.after(0,self.log_message,f"M3U8자동분석오류({filename_base_for_use}):{type(e).__name__}-{e}","ERROR"); logging.exception(f"M3U8자동분석({filename_base_for_use})예외") # noqa
+        finally:
+            if driver:driver.quit()
+            if page_source:
+                try: 
+                    s_dir=os.path.dirname(os.path.abspath(__file__)if"__file__"in locals()else os.getcwd())
+                    l_dir=os.path.dirname(LOG_FILENAME)if os.path.isabs(LOG_FILENAME)else s_dir
+                    sf_name="".join(c if c.isalnum()else"_"for c in filename_base_for_use)
+                    src_path=os.path.join(l_dir,f"last_page_source_auto_{sf_name[:50]}_v6316.html") # 버전명 업데이트
+                    with open(src_path,"w",encoding="utf-8")as f:f.write(page_source)
+                except Exception as e_w:logging.error(f"자동페이지소스저장실패:{e_w}")
+            
+            def callback_after_auto_analysis_final_v5():
+                with self.download_lock: 
+                    self.log_message(f"자동분석finally콜백:is_processing_auto False설정. 이전:{self.is_processing_auto}","DEBUG")
+                    self.is_processing_auto = False
+                self.update_global_ui_state()
+                lvl="DEBUG"if analysis_success else"WARNING"
+                self.log_message(f"자동분석완료({'성공'if analysis_success else'실패'}):{filename_base_for_use}",lvl)
+                self.root.after(0, self._process_next_pending_url) 
+            self.root.after(0,callback_after_auto_analysis_final_v5)
+
+    def analyze_m3u8_links(self, page_url, display_filename_suggestion):
+        m3u8_found_links=[];page_source="";driver=None
+        try:
+            logging.info(f"수동M3U8분석:{page_url}");self.root.after(0,self.log_message,f"페이지로드(수동):{page_url}")
+            opts=Options();[opts.add_argument(arg)for arg in["--headless","--disable-gpu","--no-sandbox","--disable-dev-shm-usage",f"user-agent={USER_AGENT}"]];[opts.add_experimental_option(k,v)for k,v in[('excludeSwitches',['enable-automation']),('useAutomationExtension',False)]] # noqa
+            try:
+                driver=webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()),options=opts)
+                driver.execute_cdp_cmd('Network.setUserAgentOverride',{"userAgent":USER_AGENT})
+            except Exception as e:
+                logging.error(f"ChromeDriver로드실패(수동):{e}");self.root.after(0,self.log_message,f"ChromeDriver로드실패(수동):{e}.","ERROR");return
+            driver.get(page_url);time.sleep(SELENIUM_JS_WAIT_TIME_S);page_source=driver.page_source
+            try:
+                js_src=driver.execute_script("return(typeof source !== 'undefined' && source.includes('.m3u8'))?source:null")
+                if js_src and js_src not in m3u8_found_links:m3u8_found_links.append(js_src);self.root.after(0,self.log_message,f"JS'source'M3U8(수동):{js_src[:70]}...","DEBUG") # noqa
+                plyr_src=driver.execute_script("return(typeof window.player !== 'undefined' && typeof window.player.source === 'string' && window.player.source.includes('.m3u8'))?window.player.source:(typeof window.hls !== 'undefined' && typeof window.hls.url === 'string' && window.hls.url.includes('.m3u8'))?window.hls.url:null") # noqa
+                if plyr_src and plyr_src not in m3u8_found_links:m3u8_found_links.append(plyr_src);self.root.after(0,self.log_message,f"JS Plyr/HLS M3U8(수동):{plyr_src[:70]}...","DEBUG") # noqa
+            except Exception as e_js:self.root.after(0,self.log_message,f"JS 직접실행오류(수동):{e_js}","WARNING")
+            if driver:driver.quit();driver=None
+            eval_s=re.search(r"eval\s*\(\s*function\s*\(p,[^)]+\)\s*\{([\s\S]+?)\}\s*\(([^)]+)\)\s*\)",page_source,re.DOTALL)
+            if eval_s:
+                eval_full_call = eval_s.group(0); eval_args_str = eval_s.group(2); pcode = ""; kstr = ""
+                first_arg_match = re.match(r"\s*'((?:\\'|[^'])*)'", eval_args_str); pcode = first_arg_match.group(1) if first_arg_match else ""
+                kstr_match = re.search(r",\s*'((?:\\'|[^'])*)'\.split\('\|'\)", eval_full_call); kstr = kstr_match.group(1) if kstr_match else ""
+                if pcode and kstr: 
+                    deob_url=self.deobfuscate_missav_source(pcode,kstr)
+                    if deob_url and deob_url not in m3u8_found_links:m3u8_found_links.append(deob_url);self.root.after(0,self.log_message,f"난독화해제M3U8(수동):{deob_url}","INFO") # noqa
+                else: logging.warning(f"수동분석:eval인자파싱실패.Args:'{eval_args_str[:100]}...' FullEval:'{eval_full_call[:100]}...'")
+            if not m3u8_found_links:
+                for link in re.findall(r'(https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*?)',page_source,re.IGNORECASE):
+                    pu=urlparse(link)
+                    if pu.scheme and pu.netloc and link not in m3u8_found_links: m3u8_found_links.append(link)
+                    logging.info(f"일반RegexM3U8(수동):{link}")
+            if m3u8_found_links:
+                unique_links=[li for i,li in enumerate(m3u8_found_links) if li not in m3u8_found_links[:i]]
+                def cb_update_manual_listbox_final_v4(): 
+                    self.link_listbox.delete(0, tk.END)
+                    for item_link in unique_links:
+                        self.link_listbox.insert(tk.END, f"[{display_filename_suggestion}] {item_link}")
+                    self.log_message(f"{len(unique_links)}개 M3U8찾음(수동). 원본: {page_url}")
+                    if unique_links:self.link_listbox.selection_set(0)
+                self.root.after(0,cb_update_manual_listbox_final_v4)
+            else:self.root.after(0,self.log_message,"M3U8링크최종실패(수동).","WARNING")
+        except Exception as e:
+            self.root.after(0,self.log_message,f"M3U8수동분석오류:{type(e).__name__}-{e}","ERROR")
+            logging.exception("M3U8수동분석예외")
+        finally:
+            if driver:driver.quit()
+            if page_source:
+                try: 
+                    s_dir=os.path.dirname(os.path.abspath(__file__)if"__file__"in locals()else os.getcwd())
+                    l_dir=os.path.dirname(LOG_FILENAME)if os.path.isabs(LOG_FILENAME)else s_dir
+                    src_path=os.path.join(l_dir,"last_page_source_manual_v6316.html") # 버전명 업데이트
+                    with open(src_path,"w",encoding="utf-8")as f:f.write(page_source)
+                except Exception as e_w:logging.error(f"수동페이지소스저장실패:{e_w}")
+            def cb_finish_manual_analysis_final_v4():
+                with self.download_lock: self.is_manual_analyzing = False
+                self.update_global_ui_state()
+            self.root.after(0,cb_finish_manual_analysis_final_v4)
+
+    def deobfuscate_missav_source(self, packed_code_params, keywords_str):
+        direct_m3u8_regex=r"""(?:file|source|src|f)\s*[:=]\s*(["'])(https?://(?:[a-zA-Z0-9.\-_]+|\[[a-fA-F0-9:]+\])(?:[:\d]+)?(?:/(?:[\w.,@?^=%&:/~+#-]*[\w@?^=%&/~+#-])?)?\.m3u8(?:[\?&][\w.,@?^=%&:/~+#-=]*)?)\1""" # noqa
+        match_direct=re.search(direct_m3u8_regex,packed_code_params,re.VERBOSE|re.IGNORECASE)
+        if match_direct:extracted_url=match_direct.group(2);logging.info(f"난독화해제(직접M3U8v2):{extracted_url}");return extracted_url
+        simple_url_match=re.search(r"(https?://[^\s\"'<>]+\.m3u8[^\s\"'<>]*)",packed_code_params)
+        if simple_url_match:extracted_url=simple_url_match.group(1);logging.info(f"난독화해제(간단M3U8):{extracted_url}");return extracted_url
+        logging.warning("직접M3U8 URL못찾음.키워드기반재구성시도(취약).")
+        keywords=keywords_str.split('|')
+        idx_map_p1={'name':"기본패턴(seg5-seg4-..)",'protocol_idx':8,'domain1_idx':7,'domain2_idx':6,'path_indices':[5,4,3,2,1],'path_separator':'-','filename_idx':14,'extension_idx':0} # noqa
+        patterns=[idx_map_p1]
+        for num,patt in enumerate(patterns):
+            p_name=patt.get('name',f"패턴{num+1}")
+            try:
+                req_idx=[patt['protocol_idx'],patt['domain1_idx'],patt['domain2_idx'],patt['filename_idx'],patt['extension_idx']]+patt['path_indices'] # noqa
+                if any(idx>=len(keywords)for idx in req_idx):logging.debug(f"키워드재구성{p_name}:인덱스범위초과.");continue
+                proto=keywords[patt['protocol_idx']];domain=f"{keywords[patt['domain1_idx']]}.{keywords[patt['domain2_idx']]}";p_sgs=[keywords[i]for i in patt['path_indices']];p_str=patt['path_separator'].join(p_sgs);fname=keywords[patt['filename_idx']];ext=keywords[patt['extension_idx']] # noqa
+                if not(proto.startswith("http")and"."in domain and fname and ext):logging.debug(f"키워드재구성{p_name}:필수요소누락/형식오류.");continue # noqa
+                url=f"{proto}://{domain}/{p_str}/{fname}.{ext}"
+                if url.endswith(".m3u8"):logging.info(f"난독화해제({p_name}):{url}");return url
+                else:
+                    if ext.lower()!="m3u8"and"m3u8"in(k.lower()for k in keywords):
+                        url_f=f"{proto}://{domain}/{p_str}/{fname}.m3u8"
+                        if url_f.endswith(".m3u8"):logging.info(f"난독화해제({p_name},강제.m3u8):{url_f}");return url_f
+                    logging.debug(f"키워드재구성{p_name}:생성URL이.m3u8아님-{url}")
+            except IndexError:logging.warning(f"키워드재구성{p_name}인덱스오류.")
+            except Exception as e:logging.error(f"키워드재구성{p_name}예외:{e}")
+        logging.error(f"M3U8 URL난독화해제최종실패.Packed:{packed_code_params[:150]},Keywords:{keywords_str[:100]}");return None
+
+    def _auto_download_add_to_queue(self, found_m3u8_links, explicit_filename_base):
+        if not found_m3u8_links: self.log_message("자동다운로드큐추가실패:M3U8링크없음.","WARNING"); return
+        out_fname = explicit_filename_base.strip() 
+        if not out_fname: out_fname = f"fname_queue_arg_empty_{int(time.time())}"; self.log_message(f"자동큐:전달된파일명비어 폴백사용:'{out_fname}'","WARNING")
+        ref_url=self.url_entry.get(); dl_folder=self.folder_path_var.get()
+        if not dl_folder: self.log_message("자동다운로드폴더오류!","ERROR"); messagebox.showerror("치명적오류","저장폴더설정안됨."); return
+        final_path=os.path.join(dl_folder,f"{out_fname}.mp4");m3u8_dl_url=found_m3u8_links[0]
+        self.log_message(f"자동 다운로드 준비: '{out_fname}' (M3U8: '{m3u8_dl_url[:50]}...')", "DEBUG")
+        with self.download_lock:
+            self.download_queue.append((m3u8_dl_url,final_path,ref_url,out_fname))
+            self.log_message(f"'{out_fname}' 자동 다운로드 대기열에 추가 (대기: {len(self.download_queue)}).","INFO")
+            self.root.after(0, self._update_download_queue_listbox)
+        self.try_start_next_download()
+
+    def start_manual_download(self):
+        sel_idx=self.link_listbox.curselection()
+        if not sel_idx:messagebox.showwarning("경고","다운로드할M3U8링크선택.");return
+        selected_item_text = self.link_listbox.get(sel_idx[0]); m3u8_url = selected_item_text
+        if "]" in selected_item_text:
+            try: m3u8_url = selected_item_text.split("]",1)[1].strip()
+            except IndexError: self.log_message(f"M3U8 URL 파싱오류(수동): {selected_item_text}", "WARNING")
+        dl_folder=self.folder_path_var.get()
+        if not dl_folder:messagebox.showerror("오류","저장폴더선택.");return
+        out_fname=self.filename_entry.get().strip()
+        if not out_fname:
+            page_url=self.url_entry.get(); extracted_fname = self.extract_filename_from_url(page_url) if page_url else ""
+            out_fname = self.sanitize_filename(extracted_fname if extracted_fname else f"dl_{urlparse(m3u8_url).path.split('/')[-1].replace('.m3u8','Video')}_{int(time.time())}") # noqa
+            self.filename_entry.delete(0,tk.END);self.filename_entry.insert(0,out_fname)
+        final_target_filepath=os.path.join(dl_folder,f"{out_fname}.mp4"); page_url_referer=self.url_entry.get()
+        if not os.path.exists(dl_folder):
+            try:os.makedirs(dl_folder)
+            except Exception as e:self.log_message(f"다운로드폴더생성실패:{e}","ERROR");return
+        with self.download_lock:
+            self.download_queue.append((m3u8_url,final_target_filepath,page_url_referer,out_fname))
+            self.log_message(f"'{out_fname}' 다운로드 대기열 추가(대기:{len(self.download_queue)}).","INFO")
+            self.root.after(0, self._update_download_queue_listbox)
+        self.try_start_next_download();self.root.after(0,self.update_global_ui_state)
+
+    def try_start_next_download(self):
+        with self.download_lock:
+            if self.active_downloads<self.MAX_CONCURRENT_DOWNLOADS and self.download_queue:
+                m3u8_url,final_target_path,ref_url,disp_fname=self.download_queue.popleft();slot_idx=-1
+                self.root.after(0, self._update_download_queue_listbox)
+                for i in range(self.MAX_CONCURRENT_DOWNLOADS):
+                    if self.progress_elements[i]['active_file_key']is None:
+                        slot_idx=i;self.progress_elements[i]['active_file_key']=final_target_path
+                        self.progress_elements[i]['_filename_for_display']=disp_fname
+                        self.progress_elements[i]['label'].config(text=f"{disp_fname[:30]}... (준비 중)")
+                        self.progress_elements[i]['bar']['value']=0;break
+                if slot_idx==-1: 
+                    self.log_message("오류:사용가능슬롯없음","ERROR")
+                    self.download_queue.appendleft((m3u8_url,final_target_path,ref_url,disp_fname))
+                    self.root.after(0, self._update_download_queue_listbox); return
+                self.active_downloads+=1
+                self.log_message(f"'{disp_fname}'다운로드시작(슬롯{slot_idx+1})...(활성:{self.active_downloads},대기:{len(self.download_queue)})","INFO")
+                self.root.after(0,self.update_global_ui_state)
+                main_dl_folder=os.path.dirname(final_target_path);base_fname_ext=os.path.basename(final_target_path)
+                tmp_dir_path=os.path.join(main_dl_folder,TEMP_DOWNLOAD_SUBDIR);os.makedirs(tmp_dir_path,exist_ok=True)
+                actual_dl_path=os.path.join(tmp_dir_path,base_fname_ext)
+                threading.Thread(target=self.download_with_yt_dlp,args=(m3u8_url,actual_dl_path,final_target_path,ref_url,disp_fname,slot_idx),name=f"Downloader-{disp_fname[:20]}").start() # noqa
+            elif not self.download_queue and self.active_downloads==0 and not self.pending_urls_queue :
+                self.log_message("모든 다운로드 및 보류 작업 완료됨 (try_start_next_download에서 확인).", "INFO")
+                self.root.after(0, self.update_global_ui_state)
+
+    def download_with_yt_dlp(self,m3u8_url,actual_dl_path,final_target_path,ref_url,disp_fname,slot_idx):
+        ret_code=-1;success_dl=False
+        try:
+            cmd=['yt-dlp','--force-overwrites','--no-part','--referer',ref_url,'-o',actual_dl_path,m3u8_url]
+            logging.info(f"yt-dlp실행({disp_fname},슬롯{slot_idx}):{' '.join(cmd)}")
+            c_flags=subprocess.CREATE_NO_WINDOW if os.name=='nt'else 0
+            proc_env = os.environ.copy(); proc_env["PYTHONIOENCODING"] = "utf-8"
+            proc=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,creationflags=c_flags,env=proc_env)
+
+            stdout_encoding = 'utf-8'
+            if os.name == 'nt':
+                try: sys_enc = locale.getpreferredencoding(False); stdout_encoding = sys_enc if sys_enc else 'cp949'
+                except Exception: stdout_encoding = 'cp949'
+                self.log_message(f"Windows: yt-dlp 출력 디코딩에 '{stdout_encoding}' 사용.", "DEBUG")
+            
+            for line_bytes in iter(proc.stdout.readline, b""):
+                if not line_bytes: break
+                try: line = line_bytes.decode(stdout_encoding, errors='replace')
+                except Exception as e_decode: logging.error(f"stdout 디코딩오류({stdout_encoding}):{e_decode},bytes:{line_bytes[:100]}"); line = line_bytes.decode('ascii',errors='replace') # noqa
+                match_percent = re.search(r"\[download\]\s+([\d.]+)%\s+of\s+(?:~\s*)?([\d.]+\s*[KMGTiBps]+)",line)
+                match_fragment = re.search(r"\[hlsnative\]\s+Fragment\s+(\d+)\s*/\s*(\d+)", line, re.IGNORECASE)
+                if match_percent:
+                    perc_str,size_str=match_percent.groups()
+                    try: perc_float=float(perc_str); self.root.after(0,self.update_ui_specific_progress,slot_idx,perc_float,disp_fname,size_str.strip())
+                    except ValueError: logging.warning(f"진행률(%) 파싱 오류: {perc_str}")
+                elif match_fragment:
+                    current_frag, total_frags = map(int, match_fragment.groups())
+                    perc_float = (current_frag / total_frags) * 100 if total_frags > 0 else 0
+                    fragment_info = f"조각 {current_frag}/{total_frags}"
+                    self.root.after(0,self.update_ui_specific_progress,slot_idx,perc_float,disp_fname,fragment_info)
+                else:
+                    trim_line=line.strip()
+                    if trim_line and not any(s.lower() in trim_line.lower() for s in ["[debug]","[info] Merging","ETA","Defaulting to HLS","Extracting URL","already been downloaded","Destination:","Processing", " Fragments", "Downloading m3u8 manifest"]): # noqa
+                        self.root.after(0,self.log_message,f"{trim_line}","DEBUG_YT")
+                logging.debug(f"YT-DLP STDOUT({disp_fname}):{line.strip()}")
+            
+            proc.stdout.close()
+            stderr_bytes = proc.stderr.read(); stderr_out = ""
+            if stderr_bytes:
+                try: stderr_out = stderr_bytes.decode(stdout_encoding, errors='replace')
+                except Exception as e_decode_err: logging.error(f"stderr 디코딩오류({stdout_encoding}):{e_decode_err},bytes:{stderr_bytes[:200]}"); stderr_out = stderr_bytes.decode('ascii',errors='replace') # noqa
+            proc.stderr.close()
+            ret_code=proc.wait()
+
+            if ret_code==0:
+                success_dl=True
+                try:
+                    final_dir=os.path.dirname(final_target_path);os.makedirs(final_dir,exist_ok=True)
+                    final_move_path=final_target_path;ctr=1;name_p,ext_p=os.path.splitext(final_target_path)
+                    while os.path.exists(final_move_path):final_move_path=f"{name_p}({ctr}){ext_p}";ctr+=1
+                    shutil.move(actual_dl_path,final_move_path);self.log_message(f"파일 이동 성공: '{disp_fname}' -> {final_move_path}","INFO");logging.info(f"yt-dlp 성공 및 이동:{m3u8_url}->{final_move_path}") # noqa
+                except Exception as e_mv:success_dl=False;self.log_message(f"오류:'{disp_fname}'파일이동실패.임시:{actual_dl_path}.오류:{e_mv}","ERROR");logging.error(f"파일이동실패({disp_fname}):{e_mv}.임시:{actual_dl_path}") # noqa
+            else:
+                self.log_message(f"오류:'{disp_fname}'yt-dlp다운로드실패(코드:{ret_code}).임시:{actual_dl_path}","ERROR")
+                if stderr_out:self.log_message(f"[yt-dlp ERROR]{stderr_out.strip()}","ERROR")
+                logging.error(f"yt-dlp실패({disp_fname},코드{ret_code})M3U8:{m3u8_url}\n임시:{actual_dl_path}\nStderr:{stderr_out}")
+                if os.path.exists(actual_dl_path):
+                    try:os.remove(actual_dl_path);logging.info(f"실패임시파일삭제:{actual_dl_path}")
+                    except OSError as e_del:logging.warning(f"실패임시파일삭제오류{actual_dl_path}:{e_del}")
+        except FileNotFoundError:self.log_message("yt-dlp/FFmpeg설치확인및PATH설정필요.","ERROR");logging.error("yt-dlp/FFmpeg FileNotFoundError") # noqa
+        except Exception as e:self.log_message(f"다운로드중오류({disp_fname}):{type(e).__name__}","ERROR");logging.exception(f"다운로드({disp_fname})예외") # noqa
+        finally:
+            with self.download_lock:self.active_downloads-=1
+            def cb_final_dl_actions_v7():
+                self.clear_progress_slot(slot_idx,"완료"if success_dl else"실패",success_dl)
+                self.log_message(f"'{disp_fname}'다운로드작업종료(활성:{self.active_downloads},대기:{len(self.download_queue)})","DEBUG")
+                self.try_start_next_download()
+                self.update_global_ui_state()
+                if self.active_downloads == 0 and not self.download_queue:
+                    self.root.after(100, self._process_next_pending_url) 
+            self.root.after(0,cb_final_dl_actions_v7)
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = VideoDownloaderApp(root)
+    root.mainloop()
